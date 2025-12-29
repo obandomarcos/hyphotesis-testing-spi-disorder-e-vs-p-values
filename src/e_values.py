@@ -1,17 +1,18 @@
 """
-E-values and P-values for Sequential Hypothesis Testing in Single-Pixel Imaging
+E-values vs P-values for Sequential Hypothesis Testing
 
 Implements:
-  1. Classical p-value framework with limitations discussion
-  2. E-value framework for optional stopping and model misspecification
-  3. Likelihood ratio e-values for Gaussian posteriors
-  4. Sequential/cumulative e-value processes for anytime-valid testing
-  5. Integration with disorder-diffusive sampling
+  1. Classical p-value framework with limitations
+  2. E-value framework with optional stopping validity
+  3. Likelihood ratio e-values for Gaussian models
+  4. Sequential testing procedures
+  5. Comparison and empirical validation
 
 References:
-  - "Safe Testing" (Grünwald, de Heide, Koolen, 2024)
-  - "Hypothesis Testing with E-values" (Ramdas & Wang, 2025)
-  - ICLR paper: Hypothesis Testing with SPI and Disorder-Diffusive Models
+  - Grünwald et al. (2024): "Safe Testing" (JRSSB)
+  - Ramdas & Wang (2025): "Hypothesis Testing with E-values" (book manuscript)
+  - TPAMI/ICLR papers: Sequential testing sections
+  - Classical hypothesis testing textbooks
 """
 
 import torch
@@ -19,648 +20,571 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from typing import Optional, Tuple, Dict, List, Callable, Union
-from dataclasses import dataclass
-from scipy.special import logsumexp
-from scipy.stats import norm, chi2
+from dataclasses import dataclass, field
+from enum import Enum
+from scipy import stats
 import warnings
+
+
+class HypothesisType(Enum):
+    """Types of hypothesis tests."""
+    ONE_SAMPLE_MEAN = "one_sample_mean"
+    TWO_SAMPLE_MEANS = "two_sample_means"
+    VARIANCE_TEST = "variance_test"
+    GOODNESS_OF_FIT = "goodness_of_fit"
+    SEQUENTIAL_LR = "sequential_lr"
+
+
+class EvidenceQuantification(Enum):
+    """Evidence quantification methods."""
+    P_VALUE = "p_value"
+    E_VALUE = "e_value"
+    BOTH = "both"
 
 
 @dataclass
 class HypothesisTestConfig:
     """Configuration for hypothesis testing."""
     # Hypothesis specification
-    h0_mean: Optional[torch.Tensor] = None  # μ_0 for H0
-    h1_mean: Optional[torch.Tensor] = None  # μ_1 for H1
-    h0_cov: Optional[torch.Tensor] = None   # Σ_0 for H0
-    h1_cov: Optional[torch.Tensor] = None   # Σ_1 for H1
+    hypothesis_type: HypothesisType = HypothesisType.ONE_SAMPLE_MEAN
+    null_hypothesis: str = "μ = μ0"
+    alternative_hypothesis: str = "μ ≠ μ0"
     
-    # Testing parameters
-    alpha: float = 0.05  # Significance level for p-values
-    evalue_threshold: float = 1.0 / 0.05  # E-value threshold (20 for α=0.05)
-    
-    # Stopping rules
-    max_measurements: int = 1000
-    min_measurements: int = 10
-    
-    # Quality threshold for reconstruction
-    quality_threshold: float = 0.1  # δ_0: ||x̂ - x*||²₂
+    # Significance/evidence levels
+    alpha: float = 0.05                # Type I error rate (p-value)
+    beta: float = 0.2                  # Type II error rate
+    e_value_threshold: float = 1.0/0.05  # E-value threshold for rejection (1/α)
     
     # Sequential testing
-    batch_size: int = 1  # Accumulate every k measurements
-    use_anytime_valid: bool = True  # Use anytime-valid e-values
+    is_sequential: bool = False        # Enable sequential testing
+    max_samples: int = 1000            # Maximum samples in sequential design
+    group_size: int = 1                # Samples per interim analysis
+    
+    # Effect size and power
+    effect_size: float = 0.5           # Standardized effect size (Cohen's d)
+    power: float = 0.8                 # Target power (1 - β)
+    
+    # Evidence quantification
+    evidence_type: EvidenceQuantification = EvidenceQuantification.BOTH
+    
+    # Verbosity
+    verbose: bool = False
+
+
+@dataclass
+class TestResult:
+    """Result of hypothesis test."""
+    # Test identification
+    test_type: HypothesisType = HypothesisType.ONE_SAMPLE_MEAN
+    
+    # P-value results
+    p_value: Optional[float] = None
+    p_value_significant: Optional[bool] = None
+    p_value_interpretation: str = ""
+    
+    # E-value results
+    e_value: Optional[float] = None
+    e_value_significant: Optional[bool] = None
+    e_value_interpretation: str = ""
+    
+    # Test statistics
+    test_statistic: float = 0.0
+    degrees_of_freedom: Optional[int] = None
+    
+    # Sample information
+    sample_size: int = 0
+    effect_size: float = 0.0
+    
+    # Sequential testing
+    is_sequential: bool = False
+    stopping_time: Optional[int] = None
+    
+    # Assumptions
+    assumptions_met: bool = True
+    assumption_notes: List[str] = field(default_factory=list)
+    
+    def to_dict(self) -> Dict:
+        """Convert to dictionary."""
+        return {
+            'test_type': self.test_type.value,
+            'p_value': self.p_value,
+            'p_value_significant': self.p_value_significant,
+            'e_value': self.e_value,
+            'e_value_significant': self.e_value_significant,
+            'test_statistic': self.test_statistic,
+            'degrees_of_freedom': self.degrees_of_freedom,
+            'sample_size': self.sample_size,
+            'effect_size': self.effect_size,
+            'stopping_time': self.stopping_time,
+        }
 
 
 class PValueTesting:
-    """
-    Classical p-value hypothesis testing framework.
+    """Classical p-value hypothesis testing."""
     
-    Limitations:
-      - Only valid for fixed sample sizes or pre-specified group-sequential designs
-      - Adaptive sampling (OED) invalidates Type I error control
-      - Requires exact null distribution (often intractable for learned priors)
-      - Cannot be computed from non-parametric posteriors easily
-    """
-    
-    def __init__(self, config: HypothesisTestConfig, device: str = "cpu"):
-        self.config = config
-        self.device = device
-        self.measurement_count = 0
-        self.test_statistics = []
-    
-    def add_test_statistic(self, t_stat: float) -> None:
-        """Record a new test statistic."""
-        self.test_statistics.append(t_stat)
-        self.measurement_count += 1
-    
-    def compute_pvalue_gaussian(self, t_obs: float, one_sided: bool = True) -> float:
+    @staticmethod
+    def one_sample_t_test(data: np.ndarray, null_mean: float = 0.0,
+                         alpha: float = 0.05,
+                         alternative: str = "two-sided") -> TestResult:
         """
-        Compute p-value assuming standard normal test statistic.
+        One-sample t-test and p-value computation.
+        
+        H0: μ = μ0
+        H1: μ ≠ μ0 (or μ > μ0, μ < μ0)
         
         Args:
-            t_obs: Observed test statistic
-            one_sided: If True, compute one-sided p-value; else two-sided
+            data: Sample data
+            null_mean: Hypothesized mean
+            alpha: Significance level
+            alternative: "two-sided", "greater", "less"
         
         Returns:
-            p-value ∈ [0, 1]
+            TestResult with p-value and decision
         """
-        if one_sided:
-            pvalue = 1.0 - norm.cdf(t_obs)
-        else:
-            pvalue = 2.0 * (1.0 - norm.cdf(np.abs(t_obs)))
+        n = len(data)
+        mean = np.mean(data)
+        std = np.std(data, ddof=1)
+        std_error = std / np.sqrt(n)
         
-        return float(np.clip(pvalue, 0, 1))
-    
-    def compute_pvalue_reconstruction_error(self, x_recon: torch.Tensor,
-                                            x_true: torch.Tensor,
-                                            test_stat: str = "mse") -> float:
-        """
-        Compute p-value for reconstruction error hypothesis test.
+        # t-statistic
+        t_stat = (mean - null_mean) / std_error
+        df = n - 1
         
-        H0: ||x̂ - x*||²₂ ≥ δ_0  (poor reconstruction)
-        H1: ||x̂ - x*||²₂ < δ_0  (good reconstruction)
+        # p-value based on alternative
+        if alternative == "two-sided":
+            p_value = 2 * (1 - stats.t.cdf(np.abs(t_stat), df))
+        elif alternative == "greater":
+            p_value = 1 - stats.t.cdf(t_stat, df)
+        else:  # less
+            p_value = stats.t.cdf(t_stat, df)
         
-        Args:
-            x_recon: Reconstructed signal
-            x_true: Ground truth signal
-            test_stat: "mse" for mean squared error, "norm" for L2 norm
+        # Decision
+        significant = p_value < alpha
         
-        Returns:
-            p-value
-        """
-        if test_stat == "mse":
-            error = F.mse_loss(x_recon, x_true).item()
-        elif test_stat == "norm":
-            error = torch.norm(x_recon - x_true).item()
-        else:
-            raise ValueError(f"Unknown test statistic: {test_stat}")
+        # Effect size
+        d = (mean - null_mean) / std if std > 0 else 0
         
-        # Z-score assuming error ~ N(δ_0, σ²_error)
-        delta_0 = self.config.quality_threshold
-        sigma_error = np.sqrt(delta_0)  # Placeholder
-        z_score = (error - delta_0) / sigma_error
-        
-        pvalue = self.compute_pvalue_gaussian(z_score, one_sided=True)
-        return pvalue
-    
-    def reject_h0_pvalue(self, pvalue: float) -> bool:
-        """
-        Reject H0 if p-value ≤ α.
-        
-        WARNING: Only valid for fixed sample size!
-        
-        Args:
-            pvalue: Computed p-value
-        
-        Returns:
-            True if H0 should be rejected
-        """
-        return pvalue <= self.config.alpha
-    
-    def sequential_reject_h0(self, pvalue: float) -> bool:
-        """
-        Sequential testing with p-values (not recommended for adaptive sampling).
-        
-        Uses Wald's sequential probability ratio test (SPRT) as comparison.
-        
-        Returns:
-            True if H0 should be rejected
-        """
-        warnings.warn(
-            "Sequential p-value testing is not recommended for adaptive sampling. "
-            "Use e-values instead (EValueTesting class)."
+        return TestResult(
+            test_type=HypothesisType.ONE_SAMPLE_MEAN,
+            p_value=p_value,
+            p_value_significant=significant,
+            p_value_interpretation=f"p={p_value:.4f}, {'significant' if significant else 'not significant'} at α={alpha}",
+            test_statistic=t_stat,
+            degrees_of_freedom=df,
+            sample_size=n,
+            effect_size=d,
         )
-        return pvalue <= self.config.alpha
+    
+    @staticmethod
+    def two_sample_t_test(data1: np.ndarray, data2: np.ndarray,
+                         alpha: float = 0.05,
+                         alternative: str = "two-sided",
+                         equal_var: bool = True) -> TestResult:
+        """
+        Two-sample t-test.
+        
+        H0: μ1 = μ2
+        H1: μ1 ≠ μ2 (or μ1 > μ2, μ1 < μ2)
+        
+        Args:
+            data1, data2: Sample data for groups
+            alpha: Significance level
+            alternative: "two-sided", "greater", "less"
+            equal_var: Assume equal variances
+        
+        Returns:
+            TestResult with p-value and decision
+        """
+        n1, n2 = len(data1), len(data2)
+        mean1, mean2 = np.mean(data1), np.mean(data2)
+        std1, std2 = np.std(data1, ddof=1), np.std(data2, ddof=1)
+        
+        if equal_var:
+            # Pooled standard error
+            sp = np.sqrt(((n1-1)*std1**2 + (n2-1)*std2**2) / (n1 + n2 - 2))
+            se = sp * np.sqrt(1/n1 + 1/n2)
+            df = n1 + n2 - 2
+        else:
+            # Welch's t-test
+            se = np.sqrt(std1**2/n1 + std2**2/n2)
+            df = (std1**2/n1 + std2**2/n2)**2 / (
+                (std1**2/n1)**2/(n1-1) + (std2**2/n2)**2/(n2-1)
+            )
+        
+        # t-statistic
+        t_stat = (mean1 - mean2) / se
+        
+        # p-value
+        if alternative == "two-sided":
+            p_value = 2 * (1 - stats.t.cdf(np.abs(t_stat), df))
+        elif alternative == "greater":
+            p_value = 1 - stats.t.cdf(t_stat, df)
+        else:
+            p_value = stats.t.cdf(t_stat, df)
+        
+        # Decision
+        significant = p_value < alpha
+        
+        # Effect size (Cohen's d)
+        pooled_std = np.sqrt(((n1-1)*std1**2 + (n2-1)*std2**2) / (n1 + n2 - 2))
+        d = (mean1 - mean2) / pooled_std if pooled_std > 0 else 0
+        
+        return TestResult(
+            test_type=HypothesisType.TWO_SAMPLE_MEANS,
+            p_value=p_value,
+            p_value_significant=significant,
+            p_value_interpretation=f"p={p_value:.4f}, {'significant' if significant else 'not significant'} at α={alpha}",
+            test_statistic=t_stat,
+            degrees_of_freedom=int(df),
+            sample_size=n1 + n2,
+            effect_size=d,
+        )
 
 
 class EValueTesting:
-    """
-    E-value framework for anytime-valid hypothesis testing.
+    """E-value hypothesis testing framework."""
     
-    Advantages over p-values:
-      1. Valid under optional stopping (anytime-valid)
-      2. Distribution-free construction possible
-      3. Robust to mild model misspecification
-      4. Naturally handles sequential/adaptive measurement
-    
-    Theory:
-      - An e-value E_n satisfies E_H0[E_n] ≤ 1
-      - E-process {E_n}_{n≥1} is a nonnegative supermartingale under H0
-      - For any data-adaptive stopping time τ, E_τ remains valid: E_H0[E_τ] ≤ 1
-    """
-    
-    def __init__(self, config: HypothesisTestConfig, device: str = "cpu"):
-        self.config = config
-        self.device = device
-        
-        # Sequential tracking
-        self.measurement_history = []
-        self.evalue_history = []
-        self.cumulative_evalue = 1.0
-        self.measurement_count = 0
-        
-        # Likelihood ratio components
-        self.log_likelihood_h0_history = []
-        self.log_likelihood_h1_history = []
-    
-    def compute_log_likelihood_gaussian(self, y: torch.Tensor,
-                                       mean: torch.Tensor,
-                                       cov: torch.Tensor) -> float:
-        """
-        Compute log p(y | μ, Σ) for Gaussian distribution.
-        
-        log p(y) = -1/2 [log|Σ| + (y-μ)ᵀ Σ⁻¹ (y-μ)]
-        
-        Args:
-            y: Observation (scalar or vector)
-            mean: Mean μ
-            cov: Covariance Σ
-        
-        Returns:
-            Log-likelihood (float)
-        """
-        y = y.to(self.device).float()
-        mean = mean.to(self.device).float()
-        cov = cov.to(self.device).float()
-        
-        # Handle scalar case
-        if y.dim() == 0:
-            y = y.unsqueeze(0)
-        if mean.dim() == 0:
-            mean = mean.unsqueeze(0)
-        
-        # Ensure matching dimensions
-        if y.shape != mean.shape:
-            y = y.reshape(mean.shape)
-        
-        try:
-            # Log determinant
-            log_det = torch.logdet(cov).item()
-            
-            # Mahalanobis distance
-            residual = y - mean
-            cov_inv = torch.linalg.inv(cov)
-            mahal = torch.dot(residual, cov_inv @ residual).item()
-            
-            log_likelihood = -0.5 * (log_det + mahal)
-        except:
-            # Fallback for singular/ill-conditioned covariance
-            log_likelihood = -0.5 * torch.sum((y - mean) ** 2).item()
-        
-        return log_likelihood
-    
-    def add_measurement(self, y_n: torch.Tensor, update_evalue: bool = True) -> None:
-        """
-        Process a new measurement and update cumulative e-value.
-        
-        Args:
-            y_n: New measurement (scalar or vector)
-            update_evalue: Whether to update cumulative e-value immediately
-        """
-        self.measurement_history.append(y_n.clone())
-        self.measurement_count += 1
-        
-        if update_evalue:
-            self.update_cumulative_evalue_from_last()
-    
-    def update_cumulative_evalue_from_last(self) -> float:
-        """
-        Update cumulative e-value using only the last measurement.
-        
-        E^cum_N = ∏_{n=1}^N [p(y_n | H1) / p(y_n | H0)]
-        
-        Returns:
-            New cumulative e-value
-        """
-        if len(self.measurement_history) == 0:
-            return self.cumulative_evalue
-        
-        y_n = self.measurement_history[-1]
-        
-        # Default to simple likelihood ratio under Gaussian assumption
-        if self.config.h0_mean is None:
-            self.config.h0_mean = torch.zeros_like(y_n)
-        if self.config.h1_mean is None:
-            self.config.h1_mean = torch.ones_like(y_n)
-        if self.config.h0_cov is None:
-            self.config.h0_cov = torch.eye(y_n.numel(), device=self.device)
-        if self.config.h1_cov is None:
-            self.config.h1_cov = torch.eye(y_n.numel(), device=self.device)
-        
-        log_ll_h0 = self.compute_log_likelihood_gaussian(
-            y_n, self.config.h0_mean, self.config.h0_cov
-        )
-        log_ll_h1 = self.compute_log_likelihood_gaussian(
-            y_n, self.config.h1_mean, self.config.h1_cov
-        )
-        
-        # Log e-value for this measurement
-        log_evalue_n = log_ll_h1 - log_ll_h0
-        
-        self.log_likelihood_h0_history.append(log_ll_h0)
-        self.log_likelihood_h1_history.append(log_ll_h1)
-        
-        # Accumulate (product → sum in log space)
-        log_cumulative = np.log(self.cumulative_evalue) + log_evalue_n
-        self.cumulative_evalue = np.exp(log_cumulative)
-        
-        self.evalue_history.append(self.cumulative_evalue)
-        
-        return self.cumulative_evalue
-    
-    def compute_likelihood_ratio_evalue(self, y: Optional[torch.Tensor] = None,
-                                        use_history: bool = True) -> float:
+    @staticmethod
+    def likelihood_ratio_e_value(data: np.ndarray, null_model: Callable,
+                                alternative_model: Callable,
+                                alpha: float = 0.05) -> TestResult:
         """
         Compute likelihood ratio e-value.
         
-        E^LR = p(y | H1) / p(y | H0)
-        
-        For Gaussian models:
-          E^LR = sqrt(|Σ_0|/|Σ_1|) * exp(-1/2 [yᵀ Σ₀⁻¹ y - yᵀ Σ₁⁻¹ y])
+        E = LR = p(data | H1) / p(data | H0)
         
         Args:
-            y: Single measurement (if None, uses accumulated history)
-            use_history: If True, return cumulative e-value from history
+            data: Observed data
+            null_model: Log likelihood function under H0
+            alternative_model: Log likelihood function under H1
+            alpha: Significance level
         
         Returns:
-            E-value (float ≥ 0)
+            TestResult with e-value
         """
-        if use_history or y is None:
-            return self.cumulative_evalue
+        # Log likelihoods
+        log_lik_h0 = null_model(data)
+        log_lik_h1 = alternative_model(data)
         
-        # Single measurement e-value
-        if self.config.h0_mean is None:
-            self.config.h0_mean = torch.zeros_like(y)
-        if self.config.h1_mean is None:
-            self.config.h1_mean = torch.ones_like(y)
-        if self.config.h0_cov is None:
-            self.config.h0_cov = torch.eye(y.numel(), device=self.device)
-        if self.config.h1_cov is None:
-            self.config.h1_cov = torch.eye(y.numel(), device=self.device)
+        # Log e-value (log LR)
+        log_e = log_lik_h1 - log_lik_h0
+        e_value = np.exp(log_e)
         
-        log_evalue = (
-            self.compute_log_likelihood_gaussian(y, self.config.h1_mean, self.config.h1_cov) -
-            self.compute_log_likelihood_gaussian(y, self.config.h0_mean, self.config.h0_cov)
+        # Threshold for rejection
+        threshold = 1.0 / alpha
+        significant = e_value > threshold
+        
+        interpretation = (
+            f"E={e_value:.4f}, "
+            f"log(E)={log_e:.4f}, "
+            f"{'evidence for H1' if significant else 'insufficient evidence'} "
+            f"(threshold={threshold:.2f})"
         )
         
-        return np.exp(log_evalue)
+        return TestResult(
+            e_value=e_value,
+            e_value_significant=significant,
+            e_value_interpretation=interpretation,
+            test_statistic=log_e,
+        )
     
-    def reject_h0_evalue(self, evalue: Optional[float] = None) -> bool:
+    @staticmethod
+    def gaussian_e_value(data: np.ndarray, null_mean: float, null_std: float,
+                        alt_mean: float, alt_std: float,
+                        alpha: float = 0.05) -> TestResult:
         """
-        Reject H0 if e-value ≥ threshold.
+        E-value for comparing Gaussian hypotheses.
         
-        Valid under optional stopping!
+        H0: N(μ0, σ0²)
+        H1: N(μ1, σ1²)
+        
+        E = (σ0/σ1)^n × exp(-½[x^T(Σ1^-1 - Σ0^-1)x + (μ0^T Σ0^-1 μ0 - μ1^T Σ1^-1 μ1)n])
         
         Args:
-            evalue: E-value to test (if None, uses current cumulative)
+            data: Observed data
+            null_mean, null_std: Parameters under H0
+            alt_mean, alt_std: Parameters under H1
+            alpha: Significance level
         
         Returns:
-            True if H0 should be rejected
+            TestResult with e-value
         """
-        if evalue is None:
-            evalue = self.cumulative_evalue
+        n = len(data)
         
-        threshold = self.config.evalue_threshold
-        return evalue >= threshold
+        # Log-likelihood ratio
+        log_lik_h0 = -0.5 * np.sum((data - null_mean)**2 / (null_std**2)) - n * np.log(null_std)
+        log_lik_h1 = -0.5 * np.sum((data - alt_mean)**2 / (alt_std**2)) - n * np.log(alt_std)
+        
+        log_e = log_lik_h1 - log_lik_h0
+        e_value = np.exp(log_e)
+        
+        # Threshold
+        threshold = 1.0 / alpha
+        significant = e_value > threshold
+        
+        interpretation = (
+            f"E={e_value:.4f}, "
+            f"{'reject H0' if significant else 'fail to reject H0'} "
+            f"(threshold={threshold:.2f})"
+        )
+        
+        return TestResult(
+            e_value=e_value,
+            e_value_significant=significant,
+            e_value_interpretation=interpretation,
+            test_statistic=log_e,
+            sample_size=n,
+        )
     
-    def get_rejection_boundary(self) -> Tuple[List[int], List[float]]:
+    @staticmethod
+    def anytime_valid_e_value_process(data_stream: np.ndarray,
+                                      null_model: Callable,
+                                      alternative_model: Callable,
+                                      alpha: float = 0.05) -> Tuple[List[float], Optional[int]]:
         """
-        Get the sequential rejection boundary as function of measurements.
+        Compute cumulative e-value over data stream (anytime-valid).
         
-        Returns:
-            (n_measurements, evalue_threshold) pairs defining rejection boundary
-        """
-        n_vals = np.arange(1, self.measurement_count + 1)
-        threshold = np.full_like(n_vals, self.config.evalue_threshold, dtype=float)
-        
-        return list(n_vals), list(threshold)
-    
-    def compute_intrinsic_evalue(self, y: torch.Tensor) -> float:
-        """
-        Compute intrinsic (universal) e-value.
-        
-        The intrinsic e-value is the maximum e-value over all alternative
-        distributions, providing robustness without specifying H1.
-        
-        For reconstruction: compares observed error against H0.
+        E_n = ∏_{i=1}^n p(y_i | H1) / p(y_i | H0)
         
         Args:
-            y: Test statistic or measurement
+            data_stream: Sequential observations (n_observations,)
+            null_model: Log likelihood function under H0
+            alternative_model: Log likelihood function under H1
+            alpha: Significance level for stopping
         
         Returns:
-            Intrinsic e-value
+            (e_values, stopping_time): Cumulative e-values and optional stopping time
         """
-        # Simplified version: use profile likelihood
-        if isinstance(y, (int, float)):
-            return float(y) if y > 0 else 1.0
+        threshold = 1.0 / alpha
+        e_values = []
+        cum_e = 1.0
+        stopping_time = None
         
-        if torch.is_tensor(y):
-            y_val = y.abs().max().item()
-            return y_val if y_val > 0 else 1.0
+        for t, obs in enumerate(data_stream):
+            # Likelihood ratio for this observation
+            log_lik_h0 = null_model(np.array([obs]))
+            log_lik_h1 = alternative_model(np.array([obs]))
+            lr_t = np.exp(log_lik_h1 - log_lik_h0)
+            
+            # Cumulative e-value
+            cum_e *= lr_t
+            e_values.append(cum_e)
+            
+            # Check stopping rule
+            if cum_e > threshold and stopping_time is None:
+                stopping_time = t + 1
         
-        return 1.0
-    
-    def power_analysis(self, effect_size: float, num_measurements: int) -> float:
-        """
-        Estimate statistical power: P(reject H0 | H1 true).
-        
-        Uses expected log e-value under H1:
-          E_H1[log E_n] = E_H1[log(p(Y_n|H1)/p(Y_n|H0))]
-                        = KL(H1 || H0)  (Kullback-Leibler divergence)
-        
-        Args:
-            effect_size: Difference in means |μ_1 - μ_0|
-            num_measurements: Number of samples before stopping
-        
-        Returns:
-            Approximate power
-        """
-        # Approximate KL divergence for Gaussian case
-        # KL(N(μ_1,Σ) || N(μ_0,Σ)) ≈ ||μ_1 - μ_0||²_Σ⁻¹ / 2
-        
-        if effect_size <= 0:
-            return 0.0
-        
-        # Expected log e-value per measurement
-        expected_log_evalue_per_n = effect_size ** 2 / 2
-        
-        # Total log e-value after N measurements
-        expected_log_evalue_total = num_measurements * expected_log_evalue_per_n
-        
-        # Probability that log e-value exceeds threshold
-        # P(E_N ≥ threshold) = P(log E_N ≥ log threshold)
-        log_threshold = np.log(self.config.evalue_threshold)
-        
-        # Approximate using normal tail (valid for large N)
-        # log E_N ~ N(N * KL, N * Var[...])  under H1
-        z_score = (log_threshold - expected_log_evalue_total) / np.sqrt(expected_log_evalue_total + 1e-8)
-        power = 1.0 - norm.cdf(z_score)
-        
-        return float(np.clip(power, 0, 1))
+        return e_values, stopping_time
 
 
-class DiffusionPosteriorEValues:
-    """
-    E-values for hypothesis testing with diffusion model posteriors.
+class HypothesisTestComparison:
+    """Compare p-value and e-value procedures."""
     
-    Integrates e-value testing with disorder-diffusive posterior sampling.
-    Handles non-parametric priors and sequential SPI measurement.
-    """
-    
-    def __init__(self, config: HypothesisTestConfig, device: str = "cpu"):
-        self.config = config
-        self.device = device
-        self.evalue_tester = EValueTesting(config, device)
-        
-        # Posterior tracking
-        self.posterior_samples = []  # List of (n_samples, dim) tensors
-        self.posterior_means = []
-        self.posterior_covs = []
-    
-    def add_posterior_sample(self, samples: torch.Tensor) -> None:
+    @staticmethod
+    def compare_evidence_quantification(data: np.ndarray,
+                                       null_mean: float,
+                                       config: HypothesisTestConfig) -> Dict:
         """
-        Add posterior samples from diffusion model.
+        Compare p-value and e-value quantification.
         
         Args:
-            samples: Posterior samples (num_samples, dim)
-        """
-        samples = samples.to(self.device)
-        
-        # Compute empirical mean and covariance
-        mean = samples.mean(dim=0)
-        cov = torch.cov(samples.T)
-        
-        self.posterior_samples.append(samples)
-        self.posterior_means.append(mean)
-        self.posterior_covs.append(cov)
-    
-    def compute_evalue_from_posterior_samples(self, 
-                                             h0_samples: torch.Tensor,
-                                             h1_samples: torch.Tensor) -> float:
-        """
-        Compute e-value by comparing posterior samples under H0 vs H1.
-        
-        Uses importance sampling approximation:
-          E = mean_H1[p(samples | H1) / p(samples | H0)]
-        
-        Args:
-            h0_samples: Samples from posterior under H0
-            h1_samples: Samples from posterior under H1
+            data: Sample data
+            null_mean: Null hypothesis mean
+            config: HypothesisTestConfig
         
         Returns:
-            Empirical e-value
+            Dictionary with both results
         """
-        h0_samples = h0_samples.to(self.device)
-        h1_samples = h1_samples.to(self.device)
+        results = {}
         
-        # Fit Gaussians to samples
-        mu_0 = h0_samples.mean(dim=0)
-        mu_1 = h1_samples.mean(dim=0)
-        cov_0 = torch.cov(h0_samples.T)
-        cov_1 = torch.cov(h1_samples.T)
-        
-        # Likelihood ratio at h1_samples
-        log_lls = []
-        for sample in h1_samples:
-            tester = EValueTesting(self.config, self.device)
-            tester.config.h0_mean = mu_0
-            tester.config.h1_mean = mu_1
-            tester.config.h0_cov = cov_0
-            tester.config.h1_cov = cov_1
+        # P-value test
+        if config.evidence_type in [EvidenceQuantification.P_VALUE, EvidenceQuantification.BOTH]:
+            p_result = PValueTesting.one_sample_t_test(
+                data, null_mean, config.alpha
+            )
+            results['p_value'] = p_result
             
-            evalue = tester.compute_likelihood_ratio_evalue(sample.unsqueeze(0))
-            log_lls.append(np.log(evalue + 1e-8))
+            if config.verbose:
+                print(f"P-value approach:")
+                print(f"  p-value = {p_result.p_value:.6f}")
+                print(f"  Significant at α={config.alpha}: {p_result.p_value_significant}")
         
-        # Average in log space
-        log_evalue = np.mean(log_lls)
-        return np.exp(log_evalue)
+        # E-value test
+        if config.evidence_type in [EvidenceQuantification.E_VALUE, EvidenceQuantification.BOTH]:
+            # Define models
+            def null_model(x):
+                mean = null_mean
+                std = np.std(x)
+                return -0.5 * np.sum((x - mean)**2 / (std**2)) - len(x) * np.log(std + 1e-8)
+            
+            def alt_model(x):
+                mean = np.mean(x)
+                std = np.std(x)
+                return -0.5 * np.sum((x - mean)**2 / (std**2)) - len(x) * np.log(std + 1e-8)
+            
+            e_result = EValueTesting.likelihood_ratio_e_value(
+                data, null_model, alt_model, config.alpha
+            )
+            results['e_value'] = e_result
+            
+            if config.verbose:
+                print(f"\nE-value approach:")
+                print(f"  e-value = {e_result.e_value:.6f}")
+                print(f"  Threshold = {1.0/config.alpha:.2f}")
+                print(f"  Significant: {e_result.e_value_significant}")
+        
+        return results
     
-    def test_reconstruction_quality(self, x_recon: torch.Tensor,
-                                    x_true: torch.Tensor) -> Tuple[float, bool]:
+    @staticmethod
+    def sequential_comparison(data_stream: np.ndarray,
+                             null_mean: float,
+                             config: HypothesisTestConfig) -> Dict:
         """
-        Test reconstruction quality using e-value framework.
-        
-        H0: ∥x̂ - x*∥²₂ ≥ δ_0  (reconstruction below quality threshold)
-        H1: ∥x̂ - x*∥²₂ < δ_0  (reconstruction meets quality)
+        Compare sequential p-value and e-value stopping times.
         
         Args:
-            x_recon: Reconstructed signal
-            x_true: Ground truth signal
+            data_stream: Sequential observations
+            null_mean: Null hypothesis mean
+            config: HypothesisTestConfig
         
         Returns:
-            (e_value, reject_h0): E-value and rejection decision
+            Dictionary with stopping times and evidence paths
         """
-        error_mse = F.mse_loss(x_recon, x_true).item()
-        delta_0 = self.config.quality_threshold
+        results = {'n': len(data_stream)}
         
-        # Setup hypothesis distributions
-        # H0: error ~ N(δ_0, 1)
-        # H1: error ~ N(δ_0/2, 1)
-        self.config.h0_mean = torch.tensor([delta_0], device=self.device)
-        self.config.h1_mean = torch.tensor([delta_0 / 2], device=self.device)
-        self.config.h0_cov = torch.tensor([[1.0]], device=self.device)
-        self.config.h1_cov = torch.tensor([[1.0]], device=self.device)
+        # P-value stopping (fixed-N simulation)
+        p_results = []
+        for n in range(1, len(data_stream) + 1):
+            p_res = PValueTesting.one_sample_t_test(data_stream[:n], null_mean, config.alpha)
+            p_results.append(p_res)
         
-        # Compute e-value
-        y = torch.tensor([error_mse], device=self.device)
-        evalue = self.evalue_tester.compute_likelihood_ratio_evalue(y, use_history=False)
-        
-        reject = self.evalue_tester.reject_h0_evalue(evalue)
-        
-        return evalue, reject
-    
-    def sequential_spi_test(self, measurements: List[float],
-                           patterns: List[torch.Tensor],
-                           x_true: Optional[torch.Tensor] = None) -> Dict:
-        """
-        Conduct sequential e-value test for SPI measurements.
-        
-        Sequentially accumulates e-values as measurements arrive.
-        Can stop at any time with valid inference.
-        
-        Args:
-            measurements: List of scalar measurements y_n
-            patterns: List of measurement patterns h_n
-            x_true: Ground truth for quality assessment (optional)
-        
-        Returns:
-            Dictionary with testing results
-        """
-        results = {
-            "measurements": [],
-            "evalues": [],
-            "rejected": [],
-            "stopping_time": None,
-            "final_evalue": 1.0,
-        }
-        
-        for n, (y_n, h_n) in enumerate(zip(measurements, patterns)):
-            # Add measurement
-            y_tensor = torch.tensor([y_n], device=self.device)
-            self.evalue_tester.add_measurement(y_tensor, update_evalue=True)
-            
-            evalue = self.evalue_tester.cumulative_evalue
-            rejected = self.evalue_tester.reject_h0_evalue(evalue)
-            
-            results["measurements"].append(y_n)
-            results["evalues"].append(evalue)
-            results["rejected"].append(rejected)
-            
-            # Check stopping criteria
-            if rejected:
-                results["stopping_time"] = n + 1
-                break
-            
-            if n >= self.config.max_measurements - 1:
-                results["stopping_time"] = n + 1
+        # Find p-value stopping time
+        p_stopping = None
+        for n, res in enumerate(p_results):
+            if res.p_value_significant:
+                p_stopping = n + 1
                 break
         
-        results["final_evalue"] = self.evalue_tester.cumulative_evalue
+        results['p_value_stopping_time'] = p_stopping
+        results['p_value_path'] = [r.p_value for r in p_results]
+        
+        # E-value stopping (anytime-valid)
+        def null_model(x):
+            std = np.std(x) if len(x) > 1 else 1.0
+            return -0.5 * np.sum((x - null_mean)**2 / (std**2 + 1e-8))
+        
+        def alt_model(x):
+            mean = np.mean(x)
+            std = np.std(x) if len(x) > 1 else 1.0
+            return -0.5 * np.sum((x - mean)**2 / (std**2 + 1e-8))
+        
+        e_values, e_stopping = EValueTesting.anytime_valid_e_value_process(
+            data_stream, null_model, alt_model, config.alpha
+        )
+        
+        results['e_value_stopping_time'] = e_stopping
+        results['e_value_path'] = e_values
+        
+        if config.verbose:
+            print(f"Sequential comparison:")
+            print(f"  P-value stopping time: {p_stopping}")
+            print(f"  E-value stopping time: {e_stopping}")
+            if p_stopping is not None and e_stopping is not None:
+                print(f"  E-value is {p_stopping/e_stopping:.2f}x faster (or slower)")
         
         return results
 
 
 def main_example():
-    """Example comparing p-values and e-values."""
+    """Example demonstrating e-values vs p-values."""
     
     print("=" * 70)
     print("E-values vs P-values for Hypothesis Testing")
     print("=" * 70)
     
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    np.random.seed(42)
     
-    # Setup hypothesis test
+    # Configuration
     config = HypothesisTestConfig(
-        h0_mean=torch.zeros(10),
-        h1_mean=torch.ones(10) * 0.5,
-        h0_cov=torch.eye(10),
-        h1_cov=torch.eye(10),
+        hypothesis_type=HypothesisType.ONE_SAMPLE_MEAN,
         alpha=0.05,
-        evalue_threshold=1.0 / 0.05,  # 20
-        device=device
+        is_sequential=True,
+        max_samples=200,
+        verbose=True
     )
     
-    # Initialize testers
-    pvalue_tester = PValueTesting(config, device=device)
-    evalue_tester = EValueTesting(config, device=device)
-    
-    print("\n1. Classical P-value Testing")
+    # Generate synthetic data
+    print("\n1. Generate Synthetic Data")
     print("-" * 70)
-    print("Limitations:")
-    print("  - Only valid for fixed sample size")
-    print("  - Adaptive sampling invalidates Type I error")
-    print("  - Requires exact null distribution")
     
-    # Single measurement test
-    y_test = torch.randn(10)
-    pvalue = pvalue_tester.compute_pvalue_reconstruction_error(
-        y_test, torch.zeros(10), test_stat="mse"
+    null_mean = 0.0
+    true_mean = 0.3  # Effect present
+    true_std = 1.0
+    n_samples = 100
+    
+    data = np.random.normal(true_mean, true_std, n_samples)
+    print(f"  Sample mean: {np.mean(data):.4f}")
+    print(f"  Sample std: {np.std(data):.4f}")
+    print(f"  Sample size: {len(data)}")
+    
+    # Fixed-sample comparison
+    print("\n2. Fixed-Sample Comparison (P-value vs E-value)")
+    print("-" * 70)
+    
+    comparison = HypothesisTestComparison.compare_evidence_quantification(
+        data, null_mean, config
     )
-    print(f"\nP-value for test: {pvalue:.6f}")
-    print(f"Reject H0 at α=0.05? {pvalue <= 0.05}")
     
-    print("\n2. E-value Testing (Anytime-Valid)")
-    print("-" * 70)
-    print("Advantages:")
-    print("  - Valid under optional stopping")
-    print("  - Distribution-free construction")
-    print("  - Robust to model misspecification")
-    
-    # Sequential measurements
-    print("\nSequential accumulation of e-values:")
-    for n in range(1, 6):
-        y_n = torch.randn(10)
-        evalue_tester.add_measurement(y_n, update_evalue=True)
-        evalue = evalue_tester.cumulative_evalue
-        reject = evalue_tester.reject_h0_evalue(evalue)
-        
-        print(f"  After {n} measurements: E = {evalue:.4f}, Reject? {reject}")
-    
-    print("\n3. Power Analysis")
+    # Sequential comparison
+    print("\n3. Sequential Comparison (Anytime-Valid E-values)")
     print("-" * 70)
     
-    effect_size = 0.5
-    for n_samples in [10, 50, 100, 200]:
-        power = evalue_tester.power_analysis(effect_size, n_samples)
-        print(f"  N={n_samples:3d}: Power = {power:.4f}")
+    # Generate longer data stream
+    data_stream = np.random.normal(true_mean, true_std, config.max_samples)
     
-    print("\n4. Sequential SPI Test")
+    seq_results = HypothesisTestComparison.sequential_comparison(
+        data_stream, null_mean, config
+    )
+    
+    print(f"\n  Total observations: {seq_results['n']}")
+    if seq_results['p_value_stopping_time'] is not None:
+        print(f"  P-value stopping time: {seq_results['p_value_stopping_time']}")
+    else:
+        print(f"  P-value: No rejection at N={seq_results['n']}")
+    
+    if seq_results['e_value_stopping_time'] is not None:
+        print(f"  E-value stopping time: {seq_results['e_value_stopping_time']}")
+    else:
+        print(f"  E-value: No rejection at N={seq_results['n']}")
+    
+    # Optional stopping validity
+    print("\n4. Optional Stopping Validity")
     print("-" * 70)
     
-    diffusion_tester = DiffusionPosteriorEValues(config, device=device)
+    print("  P-values: Invalid under optional stopping")
+    print("    - Type I error guarantee violated")
+    print("    - Requires fixed sample size or pre-planned group sequential design")
     
-    # Simulate SPI measurements
-    measurements = [1.2, 1.8, 0.9, 2.1, 1.5, 2.3, 0.8, 2.0]
-    patterns = [torch.randint(0, 2, (10,), dtype=torch.float32) for _ in measurements]
+    print("\n  E-values: Valid under optional stopping")
+    print("    - E_n forms a supermartingale under H0")
+    print("    - Can stop anytime: E(E_τ) ≤ 1 under H0")
+    print("    - No multiple testing correction needed")
     
-    results = diffusion_tester.sequential_spi_test(measurements, patterns)
+    # Two-sample test
+    print("\n5. Two-Sample Hypothesis Test")
+    print("-" * 70)
     
-    print("\nMeasurement | E-value | Reject H0?")
-    for i, (y, ev, rej) in enumerate(zip(results["measurements"], results["evalues"], results["rejected"])):
-        print(f"  {i+1:2d}       | {ev:7.2f} | {str(rej)}")
+    data1 = np.random.normal(0.0, 1.0, 50)
+    data2 = np.random.normal(0.3, 1.0, 50)
     
-    if results["stopping_time"]:
-        print(f"\nStopping time: {results['stopping_time']} measurements")
-    print(f"Final e-value: {results['final_evalue']:.4f}")
+    two_sample_result = PValueTesting.two_sample_t_test(data1, data2, config.alpha)
+    
+    print(f"  Group 1: mean={np.mean(data1):.4f}, std={np.std(data1):.4f}")
+    print(f"  Group 2: mean={np.mean(data2):.4f}, std={np.std(data2):.4f}")
+    print(f"  t-statistic: {two_sample_result.test_statistic:.4f}")
+    print(f"  p-value: {two_sample_result.p_value:.4f}")
+    print(f"  Significant: {two_sample_result.p_value_significant}")
+    print(f"  Cohen's d: {two_sample_result.effect_size:.4f}")
     
     print("\n" + "=" * 70)
     print("Example completed successfully!")

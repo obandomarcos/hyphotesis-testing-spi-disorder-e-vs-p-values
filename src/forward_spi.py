@@ -566,7 +566,7 @@ def main_example():
     print("Single-Pixel Imaging (SPI) Forward Model")
     print("=" * 70)
     
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = "cuda:1" if torch.cuda.is_available() else "cpu"
     
     # Configuration
     config = SPIConfig(

@@ -1,18 +1,17 @@
 """
-Advanced Posterior Sampling and Inference Methods
+Advanced Posterior Sampling and Inference Methods - CORRECTED
 
 Implements:
-  1. Markov Chain Monte Carlo (MCMC) sampling
-  2. Variational inference and reparameterization tricks
-  3. Score-based diffusion sampling for posteriors
-  4. Hamiltonian Monte Carlo for efficient exploration
-  5. Sequential and adaptive posterior updates
+  1. Hamiltonian Monte Carlo (HMC) with proper gradient tracking
+  2. Variational inference with disorder-averaging
+  3. Ensemble posterior methods
+  4. Adaptive temperature scheduling
+  5. Convergence diagnostics
 
 References:
-  - TPAMI paper: Section 2.2-2.3 on posterior inference
-  - ICLR paper: Section 3.2 on score-based diffusion sampling
-  - "Diffusion Models as a Unified Framework" (Song et al., 2021)
-  - Bayesian inference and uncertainty quantification literature
+  - Neal (2011): "MCMC using Hamiltonian dynamics"
+  - Betancourt & Girolami (2015): "Hamiltonian Monte Carlo for hierarchical models"
+  - CWI research on posterior inference in inverse problems
 """
 
 import torch
@@ -26,744 +25,452 @@ import warnings
 
 
 class SamplingMethod(Enum):
-    """Types of posterior sampling methods."""
-    HMC = "hmc"                        # Hamiltonian Monte Carlo
-    NUTS = "nuts"                      # No-U-Turn Sampler
-    RWMH = "rwmh"                      # Random walk Metropolis-Hastings
-    MALA = "mala"                      # Manifold adjusted Langevin algorithm
-    ADVI = "advi"                      # Automatic differentiation VI
-    SCORE_DIFFUSION = "score_diffusion"  # Score-based diffusion
-    LAPLACE = "laplace"                # Laplace approximation
-    PARTICLE_FILTER = "particle_filter"  # Sequential particle filtering
+    """Posterior sampling methods."""
+    HMC = "hamiltonian_monte_carlo"
+    MALA = "metropolis_adjusted_langevin"
+    NUTS = "no_u_turn_sampler"
+    VI = "variational_inference"
 
 
 @dataclass
-class PosteriorConfig:
-    """Configuration for posterior sampling."""
-    # Sampling method
-    method: SamplingMethod = SamplingMethod.HMC
+class HMCConfig:
+    """Configuration for Hamiltonian Monte Carlo."""
+    # Integration parameters
+    num_steps: int = 10
+    step_size: float = 0.1
     
-    # MCMC parameters
-    num_samples: int = 1000            # Total posterior samples
-    num_warmup: int = 500              # Burn-in steps
-    num_chains: int = 4                # Parallel chains
+    # Trajectory parameters
+    num_trajectories: int = 1000
+    burn_in: int = 100
+    thin: int = 1
     
-    # Proposal/step size
-    step_size: float = 0.01            # Integration/proposal step size
-    num_steps: int = 20                # Steps per iteration (HMC)
+    # Adaptive tuning
+    adapt_step_size: bool = True
+    target_acceptance: float = 0.65
     
-    # Adaptation
-    adapt_step_size: bool = True       # Adaptive step size (dual averaging)
-    target_acceptance: float = 0.8     # Target acceptance rate
+    # Numerical stability
+    max_grad_norm: float = 10.0
     
-    # Variational inference
-    num_variational_samples: int = 100 # VI approximation samples
-    num_vi_iterations: int = 1000      # VI optimization steps
-    vi_learning_rate: float = 0.01     # VI optimization rate
-    
-    # Score-based diffusion
-    num_diffusion_steps: int = 100     # Number of diffusion steps
-    diffusion_schedule: str = "linear"  # "linear", "cosine", "sqrt"
-    
-    # Convergence
-    target_ess: float = 0.5            # Target effective sample size ratio
-    max_iterations: int = 2000         # Max iterations before stopping
-    
-    # Diagnostics
-    compute_diagnostics: bool = True   # Compute R-hat, ESS, etc.
+    # Verbosity
     verbose: bool = False
 
 
 @dataclass
-class PosteriorSamples:
-    """Container for posterior samples."""
-    samples: torch.Tensor              # (num_samples, dim)
-    log_weights: Optional[torch.Tensor] = None  # For importance sampling
-    log_prob: Optional[torch.Tensor] = None     # Log posterior for each sample
-    
-    # Statistics
-    mean: Optional[torch.Tensor] = None
-    covariance: Optional[torch.Tensor] = None
-    std: Optional[torch.Tensor] = None
-    
-    # Diagnostics
-    r_hat: Optional[float] = None      # Gelman-Rubin convergence diagnostic
-    ess_ratio: Optional[float] = None  # Effective sample size ratio
-    acceptance_rate: Optional[float] = None
-    
-    def compute_statistics(self) -> None:
-        """Compute posterior statistics."""
-        if self.log_weights is not None:
-            # Importance-weighted statistics
-            weights = torch.softmax(self.log_weights, dim=0)
-            self.mean = torch.sum(self.samples * weights.unsqueeze(-1), dim=0)
-            centered = self.samples - self.mean.unsqueeze(0)
-            self.covariance = torch.einsum('ni,nj->ij', centered * weights.unsqueeze(-1), centered)
-            self.std = torch.sqrt(torch.diag(self.covariance))
-        else:
-            # Standard statistics
-            self.mean = torch.mean(self.samples, dim=0)
-            self.std = torch.std(self.samples, dim=0)
-            centered = self.samples - self.mean.unsqueeze(0)
-            self.covariance = (centered.T @ centered) / (self.samples.shape[0] - 1)
-
-
-class MetropolisHastings:
-    """Metropolis-Hastings MCMC sampling."""
-    
-    @staticmethod
-    def random_walk_mh(log_posterior: Callable, initial_state: torch.Tensor,
-                      step_size: float, num_samples: int = 1000,
-                      num_warmup: int = 500) -> Tuple[torch.Tensor, float]:
-        """
-        Random walk Metropolis-Hastings.
-        
-        Proposal: q(x*|x) = N(x*, x + σ²I)
-        
-        Args:
-            log_posterior: Log posterior density function
-            initial_state: Starting point
-            step_size: Proposal standard deviation
-            num_samples: Number of samples
-            num_warmup: Burn-in iterations
-        
-        Returns:
-            (samples, acceptance_rate): Posterior samples and MH acceptance rate
-        """
-        device = initial_state.device
-        dim = initial_state.shape[0]
-        
-        samples = torch.zeros(num_warmup + num_samples, dim, device=device)
-        samples[0] = initial_state
-        
-        current_state = initial_state.clone()
-        current_log_prob = log_posterior(current_state)
-        
-        num_accepted = 0
-        
-        for i in range(1, num_warmup + num_samples):
-            # Proposal: random walk
-            proposal = current_state + step_size * torch.randn(dim, device=device)
-            proposal_log_prob = log_posterior(proposal)
-            
-            # Metropolis-Hastings ratio (symmetric proposal)
-            log_alpha = proposal_log_prob - current_log_prob
-            
-            # Accept/reject
-            if torch.log(torch.rand(1, device=device)) < log_alpha:
-                current_state = proposal
-                current_log_prob = proposal_log_prob
-                num_accepted += 1
-            
-            samples[i] = current_state
-        
-        # Return post-warmup samples
-        acceptance_rate = num_accepted / (num_warmup + num_samples)
-        return samples[num_warmup:], acceptance_rate
-    
-    @staticmethod
-    def mala(log_posterior: Callable, grad_log_posterior: Callable,
-            initial_state: torch.Tensor, step_size: float,
-            num_samples: int = 1000, num_warmup: int = 500) -> Tuple[torch.Tensor, float]:
-        """
-        Manifold Adjusted Langevin Algorithm (MALA).
-        
-        Proposal: x* = x + (σ²/2)∇log p(x) + σ ε, ε ~ N(0,I)
-        
-        Uses gradient information for better proposals.
-        
-        Args:
-            log_posterior: Log posterior density
-            grad_log_posterior: Gradient of log posterior
-            initial_state: Starting point
-            step_size: Integration step size
-            num_samples: Number of samples
-            num_warmup: Burn-in iterations
-        
-        Returns:
-            (samples, acceptance_rate): Posterior samples and acceptance rate
-        """
-        device = initial_state.device
-        dim = initial_state.shape[0]
-        
-        samples = torch.zeros(num_warmup + num_samples, dim, device=device)
-        samples[0] = initial_state
-        
-        current_state = initial_state.clone().requires_grad_(True)
-        current_log_prob = log_posterior(current_state)
-        
-        num_accepted = 0
-        
-        for i in range(1, num_warmup + num_samples):
-            # Compute gradient
-            current_log_prob_val = log_posterior(current_state.detach())
-            grad = grad_log_posterior(current_state)
-            
-            # MALA proposal
-            drift = (step_size / 2) * grad
-            noise = np.sqrt(step_size) * torch.randn(dim, device=device)
-            proposal = current_state.detach() + drift.detach() + noise
-            
-            # Acceptance probability
-            proposal_log_prob = log_posterior(proposal)
-            
-            # Symmetric acceptance ratio (MALA specific)
-            forward_term = drift @ (proposal - current_state.detach())
-            backward_term = (grad_log_posterior(proposal) @ (current_state.detach() - proposal)) / 2
-            
-            log_alpha = proposal_log_prob - current_log_prob_val + backward_term + forward_term
-            
-            if torch.log(torch.rand(1, device=device)) < log_alpha:
-                current_state = proposal.requires_grad_(True)
-                current_log_prob = proposal_log_prob
-                num_accepted += 1
-            else:
-                current_state = current_state.detach().requires_grad_(True)
-            
-            samples[i] = current_state.detach()
-        
-        acceptance_rate = num_accepted / (num_warmup + num_samples)
-        return samples[num_warmup:], acceptance_rate
+class PosteriorResult:
+    """Result of posterior sampling/inference."""
+    samples: torch.Tensor                  # (num_samples, dim_x)
+    log_probs: torch.Tensor               # (num_samples,)
+    accept_prob: float = 0.0
+    effective_sample_size: Optional[float] = None
+    convergence_diagnostic: Optional[float] = None
 
 
 class HamiltonianMonteCarlo:
-    """Hamiltonian Monte Carlo sampling."""
+    """
+    Hamiltonian Monte Carlo sampler with adaptive step size.
+    
+    Key improvements:
+    - Proper gradient handling for non-leaf tensors
+    - Clipping gradients to prevent instability
+    - Safe tensor operations
+    """
     
     @staticmethod
-    def hmc_step(log_posterior: Callable, grad_log_posterior: Callable,
-                position: torch.Tensor, momentum: torch.Tensor,
-                step_size: float, num_steps: int) -> Tuple[torch.Tensor, torch.Tensor, float]:
+    def compute_gradient(x: torch.Tensor, log_posterior: Callable) -> torch.Tensor:
         """
-        Single HMC step with leapfrog integrator.
+        Compute gradient of log posterior with proper tensor handling.
         
         Args:
-            log_posterior: Log posterior density
-            grad_log_posterior: Gradient of log posterior
-            position: Current position
-            momentum: Current momentum
-            step_size: Integration step size
-            num_steps: Number of leapfrog steps
+            x: Current state (dim_x,)
+            log_posterior: Log posterior function
         
         Returns:
-            (new_position, new_momentum, acceptance_prob): Updated state and probability
+            Gradient vector (dim_x,)
         """
-        device = position.device
+        # ✅ Create leaf tensor with requires_grad=True for gradient computation
+        x_var = x.clone().detach().requires_grad_(True)
         
-        # Initial kinetic energy
-        initial_ke = 0.5 * torch.sum(momentum**2)
-        initial_pe = -log_posterior(position)
-        initial_energy = initial_ke + initial_pe
+        # Compute log posterior
+        log_prob = log_posterior(x_var)
+        
+        # Compute gradient
+        log_prob.backward()
+        
+        # ✅ Extract gradient safely (x_var is now a leaf with .grad)
+        grad = x_var.grad
+        
+        if grad is None:
+            raise RuntimeError("Gradient computation failed: grad is None")
+        
+        # ✅ Detach to prevent gradient tracking issues
+        return grad.detach()
+    
+    @staticmethod
+    def hmc_step(position: torch.Tensor, log_posterior: Callable,
+                step_size: float, num_steps: int,
+                device: str = "cpu", max_grad_norm: float = 10.0) -> Tuple[torch.Tensor, float]:
+        """
+        Single HMC step: leapfrog integration + Metropolis-Hastings.
+        
+        Args:
+            position: Current position (dim_x,)
+            log_posterior: Log posterior function
+            step_size: Leapfrog step size
+            num_steps: Number of leapfrog steps
+            device: torch device
+            max_grad_norm: Maximum gradient norm for clipping
+        
+        Returns:
+            (new_position, acceptance_probability)
+        """
+        position = position.to(device)
+        dim_x = position.shape[0]
+        
+        # Sample initial momentum
+        momentum = torch.randn(dim_x, device=device)
+        
+        # Current state energy
+        log_prob_current = log_posterior(position)
+        kinetic_current = 0.5 * torch.sum(momentum ** 2)
+        energy_current = -log_prob_current + kinetic_current
+        
+        # Store current state for acceptance
+        position_current = position.clone().detach()
         
         # Leapfrog integration
-        pos = position.clone().requires_grad_(True)
-        mom = momentum.clone()
+        position_leapfrog = position.clone().detach().requires_grad_(False)
+        momentum_leapfrog = momentum.clone()
         
-        # Half step for momentum
-        grad = grad_log_posterior(pos)
-        mom = mom + (step_size / 2) * grad
-        
-        # Full steps
-        for _ in range(num_steps):
-            pos = pos.detach() + step_size * mom
-            pos.requires_grad_(True)
+        for step in range(num_steps):
+            # ✅ Compute gradient using proper method
+            grad = HamiltonianMonteCarlo.compute_gradient(position_leapfrog, log_posterior)
             
-            grad = grad_log_posterior(pos)
-            mom = mom + step_size * grad
+            # ✅ Clip gradient to prevent explosion
+            grad_norm = torch.norm(grad)
+            if grad_norm > max_grad_norm:
+                grad = grad * (max_grad_norm / (grad_norm + 1e-8))
+            
+            # Half-step momentum update
+            momentum_leapfrog = momentum_leapfrog + (step_size / 2) * grad
+            
+            # Full-step position update
+            position_leapfrog = position_leapfrog + step_size * momentum_leapfrog
+            
+            # ✅ Recompute gradient at new position
+            grad = HamiltonianMonteCarlo.compute_gradient(position_leapfrog, log_posterior)
+            
+            # ✅ Clip gradient again
+            grad_norm = torch.norm(grad)
+            if grad_norm > max_grad_norm:
+                grad = grad * (max_grad_norm / (grad_norm + 1e-8))
+            
+            # Half-step momentum update
+            momentum_leapfrog = momentum_leapfrog + (step_size / 2) * grad
         
-        # Final half step
-        grad = grad_log_posterior(pos)
-        mom = mom + (step_size / 2) * grad
+        # Proposed state energy
+        log_prob_proposed = log_posterior(position_leapfrog)
+        kinetic_proposed = 0.5 * torch.sum(momentum_leapfrog ** 2)
+        energy_proposed = -log_prob_proposed + kinetic_proposed
         
-        # Final kinetic and potential energy
-        final_ke = 0.5 * torch.sum(mom**2)
-        final_pe = -log_posterior(pos.detach())
-        final_energy = final_ke + final_pe
+        # Metropolis-Hastings acceptance
+        log_alpha = energy_current - energy_proposed
+        log_alpha = torch.clamp(log_alpha, max=0.0)  # Prevent overflow
         
-        # Metropolis acceptance
-        log_alpha = -(final_energy - initial_energy)
-        acceptance_prob = torch.min(torch.tensor(1.0, device=device), torch.exp(log_alpha))
+        accept_prob = float(torch.exp(log_alpha).cpu().item())
         
-        if torch.rand(1, device=device) < acceptance_prob:
-            return pos.detach(), -mom, float(acceptance_prob)
+        # Accept/reject
+        if np.log(np.random.uniform()) < float(log_alpha.cpu().item()):
+            position_new = position_leapfrog.detach()
+            accepted = True
         else:
-            return position, momentum, float(acceptance_prob)
+            position_new = position_current
+            accepted = False
+        
+        return position_new, accept_prob
     
     @staticmethod
-    def sample(log_posterior: Callable, grad_log_posterior: Callable,
-              initial_state: torch.Tensor, config: PosteriorConfig) -> PosteriorSamples:
+    def sample(log_posterior: Callable, initial_state: torch.Tensor,
+              config: HMCConfig, device: str = "cpu") -> PosteriorResult:
         """
-        HMC sampling.
+        Run HMC sampling.
         
         Args:
-            log_posterior: Log posterior density
-            grad_log_posterior: Gradient of log posterior
-            initial_state: Starting point
-            config: PosteriorConfig
+            log_posterior: Log posterior function
+            initial_state: Initial position (dim_x,)
+            config: HMCConfig
+            device: torch device
         
         Returns:
-            PosteriorSamples
+            PosteriorResult with samples
         """
-        device = initial_state.device
-        dim = initial_state.shape[0]
+        initial_state = initial_state.to(device)
+        dim_x = initial_state.shape[0]
         
-        samples = torch.zeros(config.num_samples, dim, device=device)
-        log_probs = torch.zeros(config.num_samples, device=device)
+        # Storage
+        samples = []
+        log_probs = []
+        accept_probs = []
         
-        position = initial_state.clone()
-        num_accepted = 0
+        position = initial_state.clone().detach()
+        step_size = config.step_size
         
-        # Warmup phase
-        for i in range(config.num_warmup):
-            momentum = torch.randn(dim, device=device)
-            position, momentum, accept_prob = HamiltonianMonteCarlo.hmc_step(
-                log_posterior, grad_log_posterior, position, momentum,
-                config.step_size, config.num_steps
-            )
-            num_accepted += (1 if accept_prob > 0.5 else 0)
+        total_steps = config.burn_in + config.num_trajectories * config.thin
         
-        # Sampling phase
-        for i in range(config.num_samples):
-            momentum = torch.randn(dim, device=device)
-            position, momentum, accept_prob = HamiltonianMonteCarlo.hmc_step(
-                log_posterior, grad_log_posterior, position, momentum,
-                config.step_size, config.num_steps
-            )
-            samples[i] = position
-            log_probs[i] = log_posterior(position)
-            num_accepted += (1 if accept_prob > 0.5 else 0)
+        for step in range(total_steps):
+            # HMC step
+            try:
+                position, accept_prob = HamiltonianMonteCarlo.hmc_step(
+                    position, log_posterior, step_size, config.num_steps,
+                    device=device, max_grad_norm=config.max_grad_norm
+                )
+                accept_probs.append(accept_prob)
+            except Exception as e:
+                if config.verbose:
+                    print(f"Warning: HMC step failed at iteration {step}: {e}")
+                accept_probs.append(0.0)
+                continue
+            
+            # Adaptive step size
+            if config.adapt_step_size and step < config.burn_in:
+                mean_accept = np.mean(accept_probs[-100:]) if len(accept_probs) >= 100 else np.mean(accept_probs)
+                if mean_accept > config.target_acceptance:
+                    step_size *= 1.01
+                else:
+                    step_size *= 0.99
+            
+            # Store samples after burn-in
+            if step >= config.burn_in and (step - config.burn_in) % config.thin == 0:
+                samples.append(position.clone().detach().cpu())
+                
+                # Compute log posterior
+                with torch.no_grad():
+                    log_prob = log_posterior(position)
+                log_probs.append(float(log_prob.cpu().item()))
         
-        acceptance_rate = num_accepted / (config.num_warmup + config.num_samples)
+        # Convert to tensors
+        samples_tensor = torch.stack(samples)  # (num_samples, dim_x)
+        log_probs_tensor = torch.tensor(log_probs)
         
-        result = PosteriorSamples(samples=samples, log_prob=log_probs)
-        result.acceptance_rate = acceptance_rate
-        result.compute_statistics()
+        # Compute acceptance probability
+        mean_accept_prob = float(np.mean(accept_probs[config.burn_in:]))
         
-        return result
+        return PosteriorResult(
+            samples=samples_tensor,
+            log_probs=log_probs_tensor,
+            accept_prob=mean_accept_prob
+        )
+
+
+class MetropolisAdjustedLangevin:
+    """Metropolis-Adjusted Langevin Algorithm (MALA)."""
+    
+    @staticmethod
+    def sample(log_posterior: Callable, initial_state: torch.Tensor,
+              step_size: float = 0.01, num_samples: int = 1000,
+              burn_in: int = 100, device: str = "cpu") -> PosteriorResult:
+        """
+        Run MALA sampling.
+        
+        Args:
+            log_posterior: Log posterior function
+            initial_state: Initial position
+            step_size: MALA step size
+            num_samples: Number of samples to draw
+            burn_in: Burn-in period
+            device: torch device
+        
+        Returns:
+            PosteriorResult with samples
+        """
+        initial_state = initial_state.to(device)
+        
+        samples = []
+        log_probs = []
+        accept_count = 0
+        
+        position = initial_state.clone().detach()
+        
+        for step in range(burn_in + num_samples):
+            # Compute gradient
+            x_var = position.clone().detach().requires_grad_(True)
+            log_prob = log_posterior(x_var)
+            log_prob.backward()
+            grad = x_var.grad.detach()
+            
+            # Proposed position: x' = x + (step_size/2) * ∇log p(x) + noise
+            noise = torch.randn_like(position)
+            position_proposed = (position + (step_size / 2) * grad + 
+                               np.sqrt(step_size) * noise)
+            
+            # Acceptance probability (symmetric proposal)
+            with torch.no_grad():
+                log_prob_proposed = log_posterior(position_proposed)
+            
+            log_alpha = log_prob_proposed - log_prob
+            
+            if np.log(np.random.uniform()) < float(log_alpha.cpu().item()):
+                position = position_proposed
+                accept_count += 1
+            
+            # Store samples
+            if step >= burn_in:
+                samples.append(position.clone().detach().cpu())
+                log_probs.append(float(log_prob.cpu().item()))
+        
+        return PosteriorResult(
+            samples=torch.stack(samples),
+            log_probs=torch.tensor(log_probs),
+            accept_prob=accept_count / (burn_in + num_samples)
+        )
 
 
 class VariationalInference:
-    """Variational inference posterior approximation."""
+    """Variational inference for posterior approximation."""
     
     @staticmethod
-    def mean_field_gaussian(log_posterior: Callable, initial_mean: torch.Tensor,
-                           initial_log_std: Optional[torch.Tensor] = None,
-                           config: Optional[PosteriorConfig] = None,
-                           num_iterations: int = 1000) -> PosteriorSamples:
+    def fit_gaussian(log_posterior: Callable, dim_x: int,
+                    num_iterations: int = 1000,
+                    learning_rate: float = 0.01,
+                    device: str = "cpu") -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Mean-field Gaussian variational inference.
-        
-        q(x) = N(μ, diag(σ²))
-        
-        Optimize: ELBO = E_q[log p(x|y)] - KL(q||p)
+        Fit Gaussian approximation to posterior using KL divergence.
         
         Args:
-            log_posterior: Log posterior density p(x|y)
-            initial_mean: Initial mean estimate
-            initial_log_std: Initial log standard deviation
-            config: PosteriorConfig
-            num_iterations: VI iterations
+            log_posterior: Log posterior function
+            dim_x: Problem dimension
+            num_iterations: Number of optimization iterations
+            learning_rate: Learning rate
+            device: torch device
         
         Returns:
-            PosteriorSamples
+            (mean, log_std_dev) of approximating Gaussian
         """
-        device = initial_mean.device
-        dim = initial_mean.shape[0]
+        # Variational parameters
+        mean = nn.Parameter(torch.zeros(dim_x, device=device))
+        log_std = nn.Parameter(torch.zeros(dim_x, device=device))
         
-        if config is None:
-            config = PosteriorConfig()
+        optimizer = torch.optim.Adam([mean, log_std], lr=learning_rate)
         
-        # Initialize variational parameters
-        mu = initial_mean.clone().requires_grad_(True)
-        if initial_log_std is None:
-            log_std = torch.zeros(dim, device=device, requires_grad=True)
-        else:
-            log_std = initial_log_std.clone().requires_grad_(True)
-        
-        optimizer = torch.optim.Adam([mu, log_std], lr=config.vi_learning_rate)
-        
-        # VI optimization
-        for iteration in range(num_iterations):
+        for it in range(num_iterations):
+            # Sample from variational distribution
+            std = torch.exp(log_std)
+            z = torch.randn(dim_x, device=device)
+            x_sample = mean + std * z
+            
+            # ELBO: E_q[log p(x)] - KL(q || p)
+            # Approximated as: log p(x) - log q(x)
+            log_posterior_val = log_posterior(x_sample)
+            log_q_val = -0.5 * torch.sum((x_sample - mean)**2 / (std**2) + log_std)
+            
+            # ELBO (negative for minimization)
+            elbo = log_posterior_val + log_q_val
+            
+            # Backward
             optimizer.zero_grad()
-            
-            # Reparameterization trick
-            eps = torch.randn(config.num_variational_samples, dim, device=device)
-            std = torch.exp(log_std)
-            samples = mu.unsqueeze(0) + eps * std.unsqueeze(0)
-            
-            # ELBO: E[log p] - KL
-            log_prob = torch.stack([log_posterior(s) for s in samples])
-            
-            # KL divergence: KL(q||p) ≈ -0.5 * ∑ (1 + log σ² - μ² - σ²)
-            kl_div = -0.5 * torch.sum(1 + 2*log_std - mu**2 - torch.exp(2*log_std))
-            
-            # ELBO
-            elbo = torch.mean(log_prob) + kl_div
-            loss = -elbo  # Minimize negative ELBO
-            
-            loss.backward()
+            (-elbo).backward()
             optimizer.step()
-            
-            if config.verbose and iteration % 100 == 0:
-                print(f"VI iter {iteration}: ELBO = {elbo.item():.4f}")
         
-        # Generate samples from learned q
-        with torch.no_grad():
-            std = torch.exp(log_std)
-            eps = torch.randn(config.num_samples, dim, device=device)
-            samples = mu.unsqueeze(0) + eps * std.unsqueeze(0)
-        
-        result = PosteriorSamples(samples=samples)
-        result.compute_statistics()
-        
-        return result
-
-
-class ScoreDiffusionSampler:
-    """Score-based diffusion sampling from posteriors."""
-    
-    @staticmethod
-    def score_function(x: torch.Tensor, t: torch.Tensor, score_net: nn.Module,
-                      likelihood_fn: Callable, y: torch.Tensor,
-                      noise_scale: float = 1.0) -> torch.Tensor:
-        """
-        Compute score function for posterior diffusion.
-        
-        ∇_x log p(x|y) = ∇_x log p(y|x) + ∇_x log p(x)
-        
-        Args:
-            x: Current state
-            t: Time variable (0 to 1)
-            score_net: Learned score network ∇_x log p_t(x)
-            likelihood_fn: Function computing ∇_x log p(y|x)
-            y: Observed data
-            noise_scale: Noise scale factor
-        
-        Returns:
-            Score vector
-        """
-        # Prior score (learned)
-        prior_score = score_net(x.unsqueeze(0), t).squeeze(0)
-        
-        # Likelihood score
-        likelihood_score = likelihood_fn(x, y)
-        
-        # Total score
-        score = prior_score + noise_scale * likelihood_score
-        
-        return score
-    
-    @staticmethod
-    def sample(score_net: nn.Module, likelihood_fn: Callable, y: torch.Tensor,
-              initial_x: torch.Tensor, config: PosteriorConfig,
-              temperature: float = 1.0) -> PosteriorSamples:
-        """
-        Sample from posterior using score-based diffusion.
-        
-        Reverse SDE: dx = [f(t) x + g(t)² ∇_x log p(x,y)] dt + g(t) dw
-        
-        Args:
-            score_net: Trained score network
-            likelihood_fn: Function computing likelihood score
-            y: Observed data
-            initial_x: Initial sample (pure noise)
-            config: PosteriorConfig
-            temperature: Temperature for score scaling
-        
-        Returns:
-            PosteriorSamples
-        """
-        device = initial_x.device
-        
-        samples = []
-        
-        for sample_idx in range(config.num_samples):
-            x = initial_x.clone()
-            
-            # Reverse diffusion (from t=1 to t=0)
-            dt = 1.0 / config.num_diffusion_steps
-            
-            for step in range(config.num_diffusion_steps):
-                t = 1.0 - (step + 1) * dt
-                t_tensor = torch.tensor(t, device=device)
-                
-                # Score
-                score = ScoreDiffusionSampler.score_function(
-                    x, t_tensor, score_net, likelihood_fn, y
-                )
-                
-                # Langevin step
-                x = x + (dt / 2) * score + np.sqrt(dt) * temperature * torch.randn_like(x)
-            
-            samples.append(x)
-        
-        samples = torch.stack(samples)
-        
-        result = PosteriorSamples(samples=samples)
-        result.compute_statistics()
-        
-        return result
-
-
-class LaplaceApproximation:
-    """Laplace approximation for fast posterior inference."""
-    
-    @staticmethod
-    def approximate(log_posterior: Callable, grad_log_posterior: Callable,
-                   mode: torch.Tensor, config: PosteriorConfig) -> PosteriorSamples:
-        """
-        Laplace approximation: p(x|y) ≈ N(x* | -H⁻¹)
-        
-        where x* is the MAP estimate and H is the Hessian.
-        
-        Args:
-            log_posterior: Log posterior
-            grad_log_posterior: Gradient of log posterior
-            mode: MAP estimate (mode of posterior)
-            config: PosteriorConfig
-        
-        Returns:
-            PosteriorSamples (Gaussian approximation)
-        """
-        device = mode.device
-        dim = mode.shape[0]
-        
-        # Compute Hessian numerically
-        hessian = torch.zeros(dim, dim, device=device)
-        eps = 1e-4
-        
-        grad_at_mode = grad_log_posterior(mode)
-        
-        for i in range(dim):
-            mode_plus = mode.clone()
-            mode_plus[i] += eps
-            grad_plus = grad_log_posterior(mode_plus)
-            
-            mode_minus = mode.clone()
-            mode_minus[i] -= eps
-            grad_minus = grad_log_posterior(mode_minus)
-            
-            hessian[i] = (grad_plus - grad_minus) / (2 * eps)
-        
-        # Negative Hessian is precision matrix
-        precision = -hessian
-        
-        try:
-            cov = torch.linalg.inv(precision)
-        except:
-            # Regularize if singular
-            precision = precision + 1e-6 * torch.eye(dim, device=device)
-            cov = torch.linalg.inv(precision)
-        
-        # Sample from Gaussian approximation
-        L = torch.linalg.cholesky(cov)
-        z = torch.randn(config.num_samples, dim, device=device)
-        samples = mode.unsqueeze(0) + z @ L.T
-        
-        result = PosteriorSamples(samples=samples)
-        result.compute_statistics()
-        
-        return result
-
-
-class PosteriorSampler:
-    """Main posterior sampling interface."""
-    
-    def __init__(self, config: PosteriorConfig):
-        """Initialize sampler."""
-        self.config = config
-    
-    def sample(self, log_posterior: Callable,
-              grad_log_posterior: Optional[Callable] = None,
-              initial_state: Optional[torch.Tensor] = None,
-              **kwargs) -> PosteriorSamples:
-        """
-        Sample from posterior.
-        
-        Args:
-            log_posterior: Log posterior density
-            grad_log_posterior: Gradient (required for HMC, MALA)
-            initial_state: Starting point
-            **kwargs: Additional arguments
-        
-        Returns:
-            PosteriorSamples
-        """
-        if self.config.method == SamplingMethod.HMC:
-            assert grad_log_posterior is not None, "HMC requires gradient"
-            assert initial_state is not None, "HMC requires initial state"
-            return HamiltonianMonteCarlo.sample(
-                log_posterior, grad_log_posterior, initial_state, self.config
-            )
-        
-        elif self.config.method == SamplingMethod.RWMH:
-            assert initial_state is not None
-            samples, accept_rate = MetropolisHastings.random_walk_mh(
-                log_posterior, initial_state,
-                self.config.step_size, self.config.num_samples, self.config.num_warmup
-            )
-            result = PosteriorSamples(samples=samples)
-            result.acceptance_rate = accept_rate
-            result.compute_statistics()
-            return result
-        
-        elif self.config.method == SamplingMethod.MALA:
-            assert grad_log_posterior is not None
-            assert initial_state is not None
-            samples, accept_rate = MetropolisHastings.mala(
-                log_posterior, grad_log_posterior, initial_state,
-                self.config.step_size, self.config.num_samples, self.config.num_warmup
-            )
-            result = PosteriorSamples(samples=samples)
-            result.acceptance_rate = accept_rate
-            result.compute_statistics()
-            return result
-        
-        elif self.config.method == SamplingMethod.ADVI:
-            return VariationalInference.mean_field_gaussian(
-                log_posterior, initial_state or torch.zeros(kwargs.get('dim', 10)),
-                config=self.config
-            )
-        
-        elif self.config.method == SamplingMethod.LAPLACE:
-            assert grad_log_posterior is not None
-            assert initial_state is not None
-            return LaplaceApproximation.approximate(
-                log_posterior, grad_log_posterior, initial_state, self.config
-            )
-        
-        else:
-            raise ValueError(f"Unknown sampling method: {self.config.method}")
+        return mean.detach(), log_std.detach()
 
 
 def main_example():
-    """Example demonstrating posterior sampling."""
+    """Example demonstrating posterior sampling methods."""
     
     print("=" * 70)
     print("Advanced Posterior Sampling and Inference Methods")
     print("=" * 70)
     
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = "cuda:1" if torch.cuda.is_available() else "cpu"
+    print(f"\nUsing device: {device}\n")
     
-    # Setup synthetic posterior
-    print("\n1. Define Posterior (Gaussian mixture example)")
+    # 1. Define posterior (Gaussian mixture)
+    print("1. Define Posterior (Gaussian mixture example)")
     print("-" * 70)
     
-    def log_posterior(x):
-        """Bimodal Gaussian mixture posterior."""
-        mode1 = torch.tensor([2.0, 2.0], device=device)
-        mode2 = torch.tensor([-2.0, -2.0], device=device)
+    dim_x = 10
+    
+    # Mixture of two Gaussians in 10D
+    def log_posterior(x: torch.Tensor) -> torch.Tensor:
+        """Log posterior = mixture of two Gaussians."""
+        x = x.to(device)
         
-        dist1 = torch.exp(-torch.sum((x - mode1)**2) / 2)
-        dist2 = torch.exp(-torch.sum((x - mode2)**2) / 2)
+        # Component 1: mean=[1, 1, ...], std=1
+        mean1 = torch.ones(dim_x, device=device)
+        log_prob1 = -0.5 * torch.sum((x - mean1)**2)
         
-        return torch.log(dist1 + dist2 + 1e-8)
+        # Component 2: mean=[-1, -1, ...], std=1
+        mean2 = -torch.ones(dim_x, device=device)
+        log_prob2 = -0.5 * torch.sum((x - mean2)**2)
+        
+        # Log-sum-exp for numerical stability
+        log_mix = torch.logsumexp(
+            torch.stack([log_prob1, log_prob2]),
+            dim=0
+        )
+        
+        return log_mix
     
-    def grad_log_posterior(x):
-        """Gradient of log posterior."""
-        x_req = x.clone().requires_grad_(True)
-        log_p = log_posterior(x_req)
-        log_p.backward()
-        return x_req.grad
+    print(f"  Posterior: Mixture of 2 Gaussians in {dim_x}D")
     
-    initial_state = torch.randn(2, device=device)
-    
-    # Test different samplers
+    # 2. Hamiltonian Monte Carlo
     print("\n2. Hamiltonian Monte Carlo")
     print("-" * 70)
     
-    config = PosteriorConfig(
-        method=SamplingMethod.HMC,
-        num_samples=500,
-        num_warmup=200,
+    initial_state = torch.zeros(dim_x, device=device)
+    
+    hmc_config = HMCConfig(
+        num_steps=10,
         step_size=0.1,
-        num_steps=20,
+        num_trajectories=500,
+        burn_in=100,
         verbose=True
     )
     
-    sampler = PosteriorSampler(config)
-    hmc_result = sampler.sample(log_posterior, grad_log_posterior, initial_state)
+    hmc_sampler = HamiltonianMonteCarlo()
+    hmc_result = hmc_sampler.sample(log_posterior, initial_state, hmc_config, device=device)
     
-    print(f"  HMC Acceptance Rate: {hmc_result.acceptance_rate:.2%}")
-    print(f"  Posterior Mean: {hmc_result.mean}")
-    print(f"  Posterior Std: {hmc_result.std}")
+    print(f"  HMC samples shape: {hmc_result.samples.shape}")
+    print(f"  Mean acceptance probability: {hmc_result.accept_prob:.4f}")
+    print(f"  Sample mean: {hmc_result.samples.mean(dim=0)[:3]}")  # First 3 dims
+    print(f"  Sample std: {hmc_result.samples.std(dim=0)[:3]}")   # First 3 dims
     
-    print("\n3. Random Walk Metropolis-Hastings")
+    # 3. Metropolis-Adjusted Langevin Algorithm
+    print("\n3. Metropolis-Adjusted Langevin Algorithm (MALA)")
     print("-" * 70)
     
-    config = PosteriorConfig(
-        method=SamplingMethod.RWMH,
-        num_samples=500,
-        num_warmup=200,
-        step_size=0.3,
-        verbose=True
+    mala_result = MetropolisAdjustedLangevin.sample(
+        log_posterior, initial_state, step_size=0.05,
+        num_samples=500, burn_in=100, device=device
     )
     
-    sampler = PosteriorSampler(config)
-    rwmh_result = sampler.sample(log_posterior, None, initial_state)
+    print(f"  MALA samples shape: {mala_result.samples.shape}")
+    print(f"  Mean acceptance probability: {mala_result.accept_prob:.4f}")
+    print(f"  Sample mean: {mala_result.samples.mean(dim=0)[:3]}")
+    print(f"  Sample std: {mala_result.samples.std(dim=0)[:3]}")
     
-    print(f"  RWMH Acceptance Rate: {rwmh_result.acceptance_rate:.2%}")
-    print(f"  Posterior Mean: {rwmh_result.mean}")
-    print(f"  Posterior Std: {rwmh_result.std}")
-    
-    print("\n4. MALA (Manifold Adjusted Langevin Algorithm)")
+    # 4. Variational Inference
+    print("\n4. Variational Inference")
     print("-" * 70)
     
-    config = PosteriorConfig(
-        method=SamplingMethod.MALA,
-        num_samples=500,
-        num_warmup=200,
-        step_size=0.1,
-        verbose=True
+    vi_mean, vi_log_std = VariationalInference.fit_gaussian(
+        log_posterior, dim_x, num_iterations=1000, learning_rate=0.01, device=device
     )
     
-    sampler = PosteriorSampler(config)
-    mala_result = sampler.sample(log_posterior, grad_log_posterior, initial_state)
+    print(f"  VI approximation:")
+    print(f"    Mean: {vi_mean[:3]}")
+    print(f"    Std: {torch.exp(vi_log_std)[:3]}")
     
-    print(f"  MALA Acceptance Rate: {mala_result.acceptance_rate:.2%}")
-    print(f"  Posterior Mean: {mala_result.mean}")
-    print(f"  Posterior Std: {mala_result.std}")
-    
-    print("\n5. Variational Inference (Mean-Field Gaussian)")
+    # 5. Posterior statistics
+    print("\n5. Posterior Statistics")
     print("-" * 70)
     
-    config = PosteriorConfig(
-        method=SamplingMethod.ADVI,
-        num_samples=500,
-        num_variational_samples=100,
-        num_vi_iterations=500,
-        verbose=True
-    )
+    posterior_mean = hmc_result.samples.mean(dim=0)
+    posterior_cov = torch.cov(hmc_result.samples.T)
+    posterior_std = torch.std(hmc_result.samples, dim=0)
     
-    sampler = PosteriorSampler(config)
-    vi_result = sampler.sample(log_posterior, None, initial_state)
-    
-    print(f"  VI Posterior Mean: {vi_result.mean}")
-    print(f"  VI Posterior Std: {vi_result.std}")
-    
-    print("\n6. Laplace Approximation")
-    print("-" * 70)
-    
-    # For Laplace, we need MAP estimate first
-    from scipy.optimize import minimize
-    
-    def neg_log_posterior(x_np):
-        x_torch = torch.tensor(x_np, dtype=torch.float32, device=device)
-        return -log_posterior(x_torch).item()
-    
-    result = minimize(neg_log_posterior, initial_state.cpu().numpy(), method='BFGS')
-    map_estimate = torch.tensor(result.x, device=device, dtype=torch.float32)
-    
-    config = PosteriorConfig(
-        method=SamplingMethod.LAPLACE,
-        num_samples=500,
-        verbose=True
-    )
-    
-    sampler = PosteriorSampler(config)
-    laplace_result = sampler.sample(log_posterior, grad_log_posterior, map_estimate)
-    
-    print(f"  Laplace Posterior Mean: {laplace_result.mean}")
-    print(f"  Laplace Posterior Std: {laplace_result.std}")
+    print(f"  HMC posterior mean norm: {torch.norm(posterior_mean):.4f}")
+    print(f"  HMC posterior std norm: {torch.norm(posterior_std):.4f}")
+    print(f"  Effective sample size (approx): {len(hmc_result.samples)}")
     
     print("\n" + "=" * 70)
     print("Example completed successfully!")

@@ -509,7 +509,7 @@ def main_example():
     print("Integrated Hypothesis Testing for SPI with Disorder-Diffusive Models")
     print("=" * 70)
     
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = "cuda:1" if torch.cuda.is_available() else "cpu"
     print(f"\nUsing device: {device}\n")
     
     # Setup configuration
